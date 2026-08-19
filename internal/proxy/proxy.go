@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ghostguard/ghostguard/internal/alert"
@@ -31,6 +32,7 @@ type Proxy struct {
 	certMgr     *CertManager
 	dash        *dashboard.Dashboard
 	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 type Config struct {
@@ -225,7 +227,9 @@ func (p *Proxy) StartContext(ctx context.Context) error {
 }
 
 func (p *Proxy) Shutdown(ctx context.Context) error {
-	close(p.stopCh)
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+	})
 	if p.dashServer != nil {
 		p.dashServer.Shutdown(ctx)
 	}

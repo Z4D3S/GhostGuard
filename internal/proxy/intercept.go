@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -85,18 +88,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), bytes.NewReader(body))
-	if err != nil {
-		p.logger.LogMessage("error", fmt.Sprintf("creating proxy request: %v", err))
-		http.Error(w, "error creating request", http.StatusInternalServerError)
-		return
-	}
-
-	copyHeaders(r.Header, proxyReq.Header)
-	proxyReq.Header.Del("Proxy-Connection")
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(proxyReq)
+	resp, err := p.forwardToUpstream(r, body)
 	if err != nil {
 		p.logger.LogMessage("error", fmt.Sprintf("upstream request failed: %v", err))
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
@@ -135,7 +127,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		host = host + ":443"
 	}
 
-	targetConn, err := p.dialTLS(host)
+	targetConn, err := net.Dial("tcp", host)
 	if err != nil {
 		p.logger.LogMessage("error", fmt.Sprintf("connecting to %s: %v", host, err))
 		http.Error(w, "connection failed", http.StatusBadGateway)
@@ -187,6 +179,9 @@ func (p *Proxy) isAIEndpoint(r *http.Request) bool {
 			return true
 		}
 	}
+	if strings.Contains(r.URL.Path, "/v1/chat/completions") || strings.Contains(r.URL.Path, "/messages") {
+		return true
+	}
 	return false
 }
 
@@ -210,6 +205,13 @@ func (p *Proxy) extractToolCalls(r *http.Request, body []byte) []model.ToolCall 
 
 func (p *Proxy) parseOpenAIToolCalls(body []byte) []model.ToolCall {
 	var raw struct {
+		ToolCalls []struct {
+			ID       string `json:"id"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		} `json:"tool_calls"`
 		Messages []struct {
 			ToolCalls []struct {
 				ID       string `json:"id"`
@@ -226,11 +228,21 @@ func (p *Proxy) parseOpenAIToolCalls(body []byte) []model.ToolCall {
 	}
 
 	var toolCalls []model.ToolCall
+	for _, tc := range raw.ToolCalls {
+		var args map[string]interface{}
+		json.Unmarshal([]byte(tc.Function.Arguments), &args)
+		toolCalls = append(toolCalls, model.ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: args,
+			RawArgs:   tc.Function.Arguments,
+		})
+	}
+
 	for _, msg := range raw.Messages {
 		for _, tc := range msg.ToolCalls {
 			var args map[string]interface{}
 			json.Unmarshal([]byte(tc.Function.Arguments), &args)
-
 			toolCalls = append(toolCalls, model.ToolCall{
 				ID:        tc.ID,
 				Name:      tc.Function.Name,
@@ -382,5 +394,138 @@ func copyHeaders(src, dst http.Header) {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
+	}
+}
+
+func (p *Proxy) forwardToUpstream(r *http.Request, body []byte) (*http.Response, error) {
+	upstreamURL := *r.URL
+
+	if upstreamURL.Host == "" || upstreamURL.Scheme == "" {
+		upstreamURL.Scheme = "https"
+		host := r.Host
+		if strings.Contains(host, "127.0.0.1") || strings.Contains(host, "localhost") || strings.Contains(host, p.config.ListenAddr) {
+			if len(p.config.TargetHosts) > 0 {
+				host = p.config.TargetHosts[0]
+			}
+		}
+		upstreamURL.Host = host
+	}
+
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	copyHeaders(r.Header, proxyReq.Header)
+	proxyReq.Header.Del("Proxy-Connection")
+	proxyReq.Host = upstreamURL.Host
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	return client.Do(proxyReq)
+}
+
+func (p *Proxy) mitmHTTPS(clientConn *tls.Conn, upstreamConn net.Conn, hostname string) {
+	defer clientConn.Close()
+	defer upstreamConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+
+	for {
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+
+		req.URL.Scheme = "https"
+		req.URL.Host = hostname
+
+		start := time.Now()
+		event := &model.InterceptionEvent{
+			ID:        generateID(),
+			Method:    req.Method,
+			Path:      req.URL.Path,
+			Host:      hostname,
+			Timestamp: start.UTC(),
+		}
+
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			p.logger.LogMessage("error", fmt.Sprintf("reading request body: %v", err))
+			return
+		}
+		req.Body.Close()
+		event.RequestSize = len(body)
+
+		if p.isAIEndpoint(req) {
+			if !p.rateLimiter.Allow(req.Host) {
+				resp := &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					ProtoMajor: 1,
+					ProtoMinor: 1,
+					Header:     make(http.Header),
+				}
+				resp.Header.Set("Content-Type", "application/json")
+				resp.Write(clientConn)
+				return
+			}
+
+			toolCalls := p.extractToolCalls(req, body)
+			event.ToolCalls = toolCalls
+
+			for _, tc := range toolCalls {
+				decision := p.engine.Evaluate(&tc)
+				event.Decisions = append(event.Decisions, decision)
+
+				if err := p.logger.LogDecision(&decision); err != nil {
+					p.logger.LogMessage("error", fmt.Sprintf("logging decision: %v", err))
+				}
+
+				if decision.Action == model.DecisionDeny && !p.config.DryRun {
+					p.alertMgr.AlertDecision(&decision)
+					resp := &http.Response{
+						StatusCode: http.StatusForbidden,
+						ProtoMajor: 1,
+						ProtoMinor: 1,
+						Header:     make(http.Header),
+					}
+					resp.Header.Set("Content-Type", "application/json")
+					resp.Write(clientConn)
+					return
+				}
+
+				anomalies := p.detector.Analyze(&tc)
+				event.Anomalies = append(event.Anomalies, anomalies...)
+				for _, a := range anomalies {
+					p.alertMgr.AlertAnomaly(&a)
+				}
+			}
+		}
+
+		resp, err := p.forwardToUpstream(req, body)
+		if err != nil {
+			p.logger.LogMessage("error", fmt.Sprintf("upstream request failed: %v", err))
+			return
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return
+		}
+		event.ResponseSize = len(respBody)
+		event.UpstreamStatus = resp.StatusCode
+		event.Duration = time.Since(start)
+
+		if p.isAIEndpoint(req) {
+			event.ToolResults = p.extractToolResults(respBody)
+		}
+
+		if err := p.logger.LogEvent(event); err != nil {
+			p.logger.LogMessage("error", fmt.Sprintf("logging event: %v", err))
+		}
+
+		p.dash.RecordEvent(event)
+
+		resp.Write(clientConn)
 	}
 }
