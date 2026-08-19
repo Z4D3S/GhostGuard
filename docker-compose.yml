@@ -1,0 +1,16 @@
+services:
+  ghostguard:
+    build: .
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./policies:/app/policies:ro
+    environment:
+      - GHOSTGUARD_PORT=8081
+      - GHOSTGUARD_POLICY_DIR=/app/policies
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/ghostguard/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

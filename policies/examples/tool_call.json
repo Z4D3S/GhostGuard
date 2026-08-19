@@ -1,0 +1,8 @@
+{
+  "id": "call_abc123",
+  "name": "exec",
+  "arguments": {
+    "command": "rm -rf /important/data"
+  },
+  "raw_args": "{\"command\":\"rm -rf /important/data\"}"
+}

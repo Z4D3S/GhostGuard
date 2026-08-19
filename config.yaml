@@ -1,0 +1,15 @@
+listen_addr: ":8081"
+policy_dir: "./policies"
+target_hosts:
+  - api.openai.com
+  - api.anthropic.com
+  - generativelanguage.googleapis.com
+alert_webhook: ""
+slack_webhook: ""
+audit_log_path: ""
+detector:
+  rate_threshold: 3.0
+  entropy_threshold: 4.0
+  window_interval: "1m"
+  window_max_age: "5m"
+  max_prev_tools: 10
