@@ -24,6 +24,7 @@ type DetectorConfig struct {
 	WindowInterval    time.Duration `yaml:"window_interval"`
 	WindowMaxAge      time.Duration `yaml:"window_max_age"`
 	MaxPrevTools      int     `yaml:"max_prev_tools"`
+	BaselinePath      string  `yaml:"baseline_path"`
 }
 
 func DefaultConfig() DetectorConfig {
@@ -37,8 +38,20 @@ func DefaultConfig() DetectorConfig {
 }
 
 func NewDetector(config DetectorConfig) *Detector {
+	var rateBaseline *Baseline
+	if config.BaselinePath != "" {
+		pb, err := NewPersistentBaseline(config.BaselinePath)
+		if err == nil {
+			rateBaseline = pb.Baseline
+		} else {
+			rateBaseline = NewBaseline()
+		}
+	} else {
+		rateBaseline = NewBaseline()
+	}
+
 	return &Detector{
-		rateBaseline: NewBaseline(),
+		rateBaseline: rateBaseline,
 		window:       NewSlidingWindow(config.WindowInterval, config.WindowMaxAge),
 		knownTools:   make(map[string]bool),
 		config:       config,

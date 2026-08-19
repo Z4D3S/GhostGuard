@@ -114,6 +114,8 @@ func (d *Dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/metrics":
 		d.handleMetrics(w, r)
+	case "/prometheus":
+		d.handlePrometheus(w, r)
 	case "/events":
 		d.handleSSE(w, r)
 	case "/health":
@@ -128,6 +130,52 @@ func (d *Dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (d *Dashboard) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(d.GetMetrics())
+}
+
+func (d *Dashboard) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	metrics := d.GetMetrics()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Header().Set("Content-Type", "text/plain")
+
+	lines := []string{
+		"# HELP ghostguard_requests_total Total number of requests",
+		"# TYPE ghostguard_requests_total counter",
+		"ghostguard_requests_total " + formatInt64(metrics.TotalRequests),
+		"# HELP ghostguard_tool_calls_total Total number of tool calls",
+		"# TYPE ghostguard_tool_calls_total counter",
+		"ghostguard_tool_calls_total " + formatInt64(metrics.TotalToolCalls),
+		"# HELP ghostguard_denied_total Total number of denied calls",
+		"# TYPE ghostguard_denied_total counter",
+		"ghostguard_denied_total " + formatInt64(metrics.DeniedCalls),
+		"# HELP ghostguard_allowed_total Total number of allowed calls",
+		"# TYPE ghostguard_allowed_total counter",
+		"ghostguard_allowed_total " + formatInt64(metrics.AllowedCalls),
+		"# HELP ghostguard_anomalies_total Total number of anomalies detected",
+		"# TYPE ghostguard_anomalies_total counter",
+		"ghostguard_anomalies_total " + formatInt64(metrics.AnomaliesDetected),
+	}
+	for tool, count := range metrics.ToolCounts {
+		lines = append(lines,
+			"# HELP ghostguard_tool_calls_by_name Tool calls by tool name",
+			"# TYPE ghostguard_tool_calls_by_name counter",
+			`ghostguard_tool_calls_by_name{tool="`+tool+`"} `+formatInt64(count),
+		)
+	}
+	for action, count := range metrics.PolicyDecisions {
+		lines = append(lines,
+			"# HELP ghostguard_policy_decisions_total Policy decisions by action",
+			"# TYPE ghostguard_policy_decisions_total counter",
+			`ghostguard_policy_decisions_total{action="`+action+`"} `+formatInt64(count),
+		)
+	}
+
+	for _, line := range lines {
+		w.Write([]byte(line + "\n"))
+	}
+}
+
+func formatInt64(v int64) string {
+	return fmt.Sprintf("%d", v)
 }
 
 func (d *Dashboard) handleSSE(w http.ResponseWriter, r *http.Request) {

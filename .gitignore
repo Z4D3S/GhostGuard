@@ -1,4 +1,4 @@
-ghostguard
+/ghostguard
 *.pem
 *.db
 data/

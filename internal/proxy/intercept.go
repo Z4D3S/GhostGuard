@@ -201,6 +201,10 @@ func (p *Proxy) extractToolCalls(r *http.Request, body []byte) []model.ToolCall 
 		toolCalls = append(toolCalls, p.parseAnthropicToolCalls(body)...)
 	}
 
+	if strings.Contains(r.Host, "generativelanguage.googleapis.com") {
+		toolCalls = append(toolCalls, p.parseGeminiToolCalls(body)...)
+	}
+
 	return toolCalls
 }
 
@@ -262,6 +266,39 @@ func (p *Proxy) parseAnthropicToolCalls(body []byte) []model.ToolCall {
 					ID:        fmt.Sprintf("tool-%s", content.Name),
 					Name:      content.Name,
 					Arguments: content.Input,
+					RawArgs:   string(rawArgs),
+				})
+			}
+		}
+	}
+	return toolCalls
+}
+
+func (p *Proxy) parseGeminiToolCalls(body []byte) []model.ToolCall {
+	var raw struct {
+		Contents []struct {
+			Parts []struct {
+				FunctionCall *struct {
+					Name string                 `json:"name"`
+					Args map[string]interface{} `json:"args"`
+				} `json:"functionCall,omitempty"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+
+	var toolCalls []model.ToolCall
+	for _, content := range raw.Contents {
+		for _, part := range content.Parts {
+			if part.FunctionCall != nil {
+				rawArgs, _ := json.Marshal(part.FunctionCall.Args)
+				toolCalls = append(toolCalls, model.ToolCall{
+					ID:        fmt.Sprintf("gemini-%s", part.FunctionCall.Name),
+					Name:      part.FunctionCall.Name,
+					Arguments: part.FunctionCall.Args,
 					RawArgs:   string(rawArgs),
 				})
 			}
